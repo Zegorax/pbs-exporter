@@ -103,3 +103,66 @@ groups:
         annotations:
           summary: Host CPU high iowait (instance {{ $labels.instance }})
           description: "CPU iowait > 10%. A high iowait means that you are disk or network bound.\n  VALUE = {{ $value }}\n  LABELS = {{ $labels }}"
+
+      - alert: ProxmoxBackupSyncJobFailed
+        expr: 'pbs_sync_job_last_run_status{status="error"} == 1'
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Proxmox sync job failed (job {{ $labels.job_id }})
+          description: "The last run of sync job {{ $labels.job_id }} on datastore {{ $labels.datastore }} failed."
+
+      - alert: ProxmoxBackupPruneJobFailed
+        expr: 'pbs_prune_job_last_run_status{status="error"} == 1'
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Proxmox prune job failed (job {{ $labels.job_id }})
+          description: "The last run of prune job {{ $labels.job_id }} on datastore {{ $labels.datastore }} failed."
+
+      - alert: ProxmoxBackupVerifyJobFailed
+        expr: 'pbs_verify_job_last_run_status{status="error"} == 1'
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Proxmox verify job failed (job {{ $labels.job_id }})
+          description: "The last run of verify job {{ $labels.job_id }} on datastore {{ $labels.datastore }} failed."
+
+      - alert: ProxmoxBackupGarbageCollectionFailed
+        expr: 'pbs_gc_last_run_status{status="error"} == 1'
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Proxmox garbage collection failed (datastore {{ $labels.datastore }})
+          description: "The last garbage collection on datastore {{ $labels.datastore }} failed."
+
+      - alert: ProxmoxBackupGarbageCollectionNotRunRecently
+        expr: "(time() - pbs_gc_last_run_start_timestamp_seconds) / 3600 / 24 > 7"
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: No Proxmox garbage collection finished for 7 days (datastore {{ $labels.datastore }})
+          description: "No garbage collection on datastore {{ $labels.datastore }} has finished in the last 7 days. Check if it is failing or running for a very long time (pbs_gc_running)."
+
+      - alert: ProxmoxBackupDatastoreInMaintenance
+        expr: 'pbs_datastore_info{maintenance_mode!="none"} == 1'
+        for: 1h
+        labels:
+          severity: info
+        annotations:
+          summary: Proxmox datastore in maintenance mode (datastore {{ $labels.datastore }})
+          description: "Datastore {{ $labels.datastore }} is in {{ $labels.maintenance_mode }} maintenance mode."
+
+      - alert: ProxmoxBackupTaskRunningTooLong
+        expr: "(time() - pbs_task_running_start_timestamp_seconds) / 3600 > 12"
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Proxmox task running for more than 12 hours ({{ $labels.worker_type }} {{ $labels.worker_id }})
+          description: "Task {{ $labels.worker_type }} {{ $labels.worker_id }} has been running for {{ $value | humanize }} hours."
