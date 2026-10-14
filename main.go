@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -25,6 +27,10 @@ const versionApi = "/api2/json/version"
 const datastoreUsageApi = "/api2/json/status/datastore-usage"
 const datastoreApi = "/api2/json/admin/datastore"
 const nodeApi = "/api2/json/nodes"
+const gcApi = "/api2/json/admin/gc"
+const syncApi = "/api2/json/admin/sync"
+const pruneApi = "/api2/json/admin/prune"
+const verifyApi = "/api2/json/admin/verify"
 
 // These variables are set in build step
 var Version = "v0.0.0-dev.0"
@@ -198,7 +204,169 @@ var (
 		"The load for 15 minutes of the host.",
 		nil, nil,
 	)
+	datastore_info = prometheus.NewDesc(
+		prometheus.BuildFQName(promNamespace, "", "datastore_info"),
+		"The info of a datastore.",
+		[]string{"datastore", "backend_type", "mount_status", "maintenance_mode"}, nil,
+	)
+	datastore_estimated_full_timestamp_seconds = prometheus.NewDesc(
+		prometheus.BuildFQName(promNamespace, "", "datastore_estimated_full_timestamp_seconds"),
+		"The estimated timestamp (unix seconds) when the datastore will be full.",
+		[]string{"datastore"}, nil,
+	)
+	datastore_index_data_bytes = prometheus.NewDesc(
+		prometheus.BuildFQName(promNamespace, "", "datastore_index_data_bytes"),
+		"The bytes referenced by all indexes of the datastore (before deduplication), as of the last GC.",
+		[]string{"datastore"}, nil,
+	)
+	datastore_disk_bytes = prometheus.NewDesc(
+		prometheus.BuildFQName(promNamespace, "", "datastore_disk_bytes"),
+		"The bytes used by chunks on disk (after deduplication), as of the last GC.",
+		[]string{"datastore"}, nil,
+	)
+	datastore_disk_chunks = prometheus.NewDesc(
+		prometheus.BuildFQName(promNamespace, "", "datastore_disk_chunks"),
+		"The number of chunks on disk, as of the last GC.",
+		[]string{"datastore"}, nil,
+	)
+	datastore_index_file_count = prometheus.NewDesc(
+		prometheus.BuildFQName(promNamespace, "", "datastore_index_file_count"),
+		"The number of index files of the datastore, as of the last GC.",
+		[]string{"datastore"}, nil,
+	)
+	gc_last_run_status = prometheus.NewDesc(
+		prometheus.BuildFQName(promNamespace, "", "gc_last_run_status"),
+		"Indicates if the last garbage collection run is in the state indicated by the label.",
+		[]string{"datastore", "status"}, nil,
+	)
+	gc_last_run_end_timestamp_seconds = prometheus.NewDesc(
+		prometheus.BuildFQName(promNamespace, "", "gc_last_run_end_timestamp_seconds"),
+		"The end timestamp (unix seconds) of the last garbage collection run.",
+		[]string{"datastore"}, nil,
+	)
+	gc_last_run_duration_seconds = prometheus.NewDesc(
+		prometheus.BuildFQName(promNamespace, "", "gc_last_run_duration_seconds"),
+		"The duration in seconds of the last garbage collection run.",
+		[]string{"datastore"}, nil,
+	)
+	gc_next_run_timestamp_seconds = prometheus.NewDesc(
+		prometheus.BuildFQName(promNamespace, "", "gc_next_run_timestamp_seconds"),
+		"The timestamp (unix seconds) of the next scheduled garbage collection run.",
+		[]string{"datastore"}, nil,
+	)
+	gc_running = prometheus.NewDesc(
+		prometheus.BuildFQName(promNamespace, "", "gc_running"),
+		"Is a garbage collection currently running.",
+		[]string{"datastore"}, nil,
+	)
+	gc_last_run_start_timestamp_seconds = prometheus.NewDesc(
+		prometheus.BuildFQName(promNamespace, "", "gc_last_run_start_timestamp_seconds"),
+		"The start timestamp (unix seconds) of the last finished garbage collection run.",
+		[]string{"datastore"}, nil,
+	)
+	gc_removed_bytes = prometheus.NewDesc(
+		prometheus.BuildFQName(promNamespace, "", "gc_removed_bytes"),
+		"The bytes removed by the last garbage collection run.",
+		[]string{"datastore"}, nil,
+	)
+	gc_removed_chunks = prometheus.NewDesc(
+		prometheus.BuildFQName(promNamespace, "", "gc_removed_chunks"),
+		"The chunks removed by the last garbage collection run.",
+		[]string{"datastore"}, nil,
+	)
+	gc_pending_bytes = prometheus.NewDesc(
+		prometheus.BuildFQName(promNamespace, "", "gc_pending_bytes"),
+		"The bytes pending removal after the last garbage collection run.",
+		[]string{"datastore"}, nil,
+	)
+	gc_pending_chunks = prometheus.NewDesc(
+		prometheus.BuildFQName(promNamespace, "", "gc_pending_chunks"),
+		"The chunks pending removal after the last garbage collection run.",
+		[]string{"datastore"}, nil,
+	)
+	gc_removed_bad_chunks = prometheus.NewDesc(
+		prometheus.BuildFQName(promNamespace, "", "gc_removed_bad_chunks"),
+		"The bad chunks removed by the last garbage collection run.",
+		[]string{"datastore"}, nil,
+	)
+	gc_still_bad_chunks = prometheus.NewDesc(
+		prometheus.BuildFQName(promNamespace, "", "gc_still_bad_chunks"),
+		"The bad chunks still present after the last garbage collection run.",
+		[]string{"datastore"}, nil,
+	)
+	sync_job_descs                       = newJobDescs("sync_job", "sync job", []string{"remote", "remote_store", "direction"})
+	prune_job_descs                      = newJobDescs("prune_job", "prune job", []string{"namespace"})
+	verify_job_descs                     = newJobDescs("verify_job", "verify job", nil)
+	task_running_start_timestamp_seconds = prometheus.NewDesc(
+		prometheus.BuildFQName(promNamespace, "", "task_running_start_timestamp_seconds"),
+		"The start timestamp (unix seconds) of a currently running task.",
+		[]string{"worker_type", "worker_id"}, nil,
+	)
+
+	jobStatuses = []string{"ok", "warning", "error"}
 )
+
+// jobDescs holds the metric descriptions shared by sync, prune and verify jobs.
+type jobDescs struct {
+	info             *prometheus.Desc
+	lastRunStatus    *prometheus.Desc
+	lastRunStartTime *prometheus.Desc
+	lastRunEndTime   *prometheus.Desc
+	lastRunDuration  *prometheus.Desc
+	nextRunTime      *prometheus.Desc
+	running          *prometheus.Desc
+}
+
+func newJobDescs(kind string, name string, infoLabels []string) jobDescs {
+	labels := []string{"datastore", "job_id"}
+	return jobDescs{
+		info: prometheus.NewDesc(
+			prometheus.BuildFQName(promNamespace, "", kind+"_info"),
+			"The info of a "+name+".",
+			append(append([]string{}, labels...), infoLabels...), nil,
+		),
+		lastRunStatus: prometheus.NewDesc(
+			prometheus.BuildFQName(promNamespace, "", kind+"_last_run_status"),
+			"Indicates if the last run of a "+name+" is in the state indicated by the label.",
+			append(append([]string{}, labels...), "status"), nil,
+		),
+		lastRunStartTime: prometheus.NewDesc(
+			prometheus.BuildFQName(promNamespace, "", kind+"_last_run_start_timestamp_seconds"),
+			"The start timestamp (unix seconds) of the last run of a "+name+".",
+			labels, nil,
+		),
+		lastRunEndTime: prometheus.NewDesc(
+			prometheus.BuildFQName(promNamespace, "", kind+"_last_run_end_timestamp_seconds"),
+			"The end timestamp (unix seconds) of the last run of a "+name+".",
+			labels, nil,
+		),
+		lastRunDuration: prometheus.NewDesc(
+			prometheus.BuildFQName(promNamespace, "", kind+"_last_run_duration_seconds"),
+			"The duration in seconds of the last run of a "+name+".",
+			labels, nil,
+		),
+		nextRunTime: prometheus.NewDesc(
+			prometheus.BuildFQName(promNamespace, "", kind+"_next_run_timestamp_seconds"),
+			"The timestamp (unix seconds) of the next scheduled run of a "+name+".",
+			labels, nil,
+		),
+		running: prometheus.NewDesc(
+			prometheus.BuildFQName(promNamespace, "", kind+"_running"),
+			"Is the "+name+" currently running.",
+			labels, nil,
+		),
+	}
+}
+
+func (d jobDescs) describe(ch chan<- *prometheus.Desc) {
+	ch <- d.info
+	ch <- d.lastRunStatus
+	ch <- d.lastRunStartTime
+	ch <- d.lastRunEndTime
+	ch <- d.lastRunDuration
+	ch <- d.nextRunTime
+	ch <- d.running
+}
 
 type VersionResponse struct {
 	Data struct {
@@ -210,20 +378,102 @@ type VersionResponse struct {
 
 type DatastoreResponse struct {
 	Data []struct {
-		Avail     int64  `json:"avail"`
-		Store     string `json:"store"`
-		Total     int64  `json:"total"`
-		Used      int64  `json:"used"`
-		Namespace string `json:"ns"`
+		Avail             int64     `json:"avail"`
+		Store             string    `json:"store"`
+		Total             int64     `json:"total"`
+		Used              int64     `json:"used"`
+		Namespace         string    `json:"ns"`
+		EstimatedFullDate int64     `json:"estimated-full-date"`
+		GCStatus          *GCStatus `json:"gc-status"`
 	} `json:"data"`
 }
 
 type Datastore struct {
-	Avail     int64  `json:"avail"`
-	Store     string `json:"store"`
-	Total     int64  `json:"total"`
-	Used      int64  `json:"used"`
-	Namespace string `json:"ns"`
+	Avail             int64     `json:"avail"`
+	Store             string    `json:"store"`
+	Total             int64     `json:"total"`
+	Used              int64     `json:"used"`
+	Namespace         string    `json:"ns"`
+	EstimatedFullDate int64     `json:"estimated-full-date"`
+	GCStatus          *GCStatus `json:"gc-status"`
+}
+
+type GCStatus struct {
+	DiskBytes      int64  `json:"disk-bytes"`
+	DiskChunks     int64  `json:"disk-chunks"`
+	IndexDataBytes int64  `json:"index-data-bytes"`
+	IndexFileCount int64  `json:"index-file-count"`
+	PendingBytes   int64  `json:"pending-bytes"`
+	PendingChunks  int64  `json:"pending-chunks"`
+	RemovedBad     int64  `json:"removed-bad"`
+	RemovedBytes   int64  `json:"removed-bytes"`
+	RemovedChunks  int64  `json:"removed-chunks"`
+	StillBad       int64  `json:"still-bad"`
+	Upid           string `json:"upid"`
+}
+
+type DatastoreListResponse struct {
+	Data []struct {
+		Store       string `json:"store"`
+		BackendType string `json:"backend-type"`
+		MountStatus string `json:"mount-status"`
+		Maintenance string `json:"maintenance"`
+	} `json:"data"`
+}
+
+type GCJobResponse struct {
+	Data []struct {
+		GCStatus
+		Store          string `json:"store"`
+		LastRunState   string `json:"last-run-state"`
+		LastRunEndtime *int64 `json:"last-run-endtime"`
+		Duration       *int64 `json:"duration"`
+		NextRun        *int64 `json:"next-run"`
+	} `json:"data"`
+}
+
+// JobStatus is the run state PBS returns for sync, prune and verify jobs.
+type JobStatus struct {
+	LastRunState   string `json:"last-run-state"`
+	LastRunEndtime *int64 `json:"last-run-endtime"`
+	LastRunUpid    string `json:"last-run-upid"`
+	NextRun        *int64 `json:"next-run"`
+}
+
+type SyncJobResponse struct {
+	Data []struct {
+		JobStatus
+		ID            string `json:"id"`
+		Store         string `json:"store"`
+		Remote        string `json:"remote"`
+		RemoteStore   string `json:"remote-store"`
+		SyncDirection string `json:"sync-direction"`
+	} `json:"data"`
+}
+
+type PruneJobResponse struct {
+	Data []struct {
+		JobStatus
+		ID        string `json:"id"`
+		Store     string `json:"store"`
+		Namespace string `json:"ns"`
+	} `json:"data"`
+}
+
+type TaskResponse struct {
+	Data []struct {
+		WorkerType string `json:"worker_type"`
+		WorkerID   string `json:"worker_id"`
+		StartTime  int64  `json:"starttime"`
+	} `json:"data"`
+}
+
+type VerifyJobResponse struct {
+	Data []struct {
+		JobStatus
+		ID    string `json:"id"`
+		Store string `json:"store"`
+	} `json:"data"`
 }
 
 type NamespaceResponse struct {
@@ -326,6 +576,28 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- host_load1
 	ch <- host_load5
 	ch <- host_load15
+	ch <- datastore_info
+	ch <- datastore_estimated_full_timestamp_seconds
+	ch <- datastore_index_data_bytes
+	ch <- datastore_disk_bytes
+	ch <- datastore_disk_chunks
+	ch <- datastore_index_file_count
+	ch <- gc_last_run_status
+	ch <- gc_last_run_end_timestamp_seconds
+	ch <- gc_last_run_duration_seconds
+	ch <- gc_next_run_timestamp_seconds
+	ch <- gc_running
+	ch <- gc_last_run_start_timestamp_seconds
+	ch <- gc_removed_bytes
+	ch <- gc_removed_chunks
+	ch <- gc_pending_bytes
+	ch <- gc_pending_chunks
+	ch <- gc_removed_bad_chunks
+	ch <- gc_still_bad_chunks
+	ch <- task_running_start_timestamp_seconds
+	sync_job_descs.describe(ch)
+	prune_job_descs.describe(ch)
+	verify_job_descs.describe(ch)
 }
 
 func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
@@ -418,7 +690,350 @@ func (e *Exporter) collectFromAPI(ch chan<- prometheus.Metric) error {
 		return err
 	}
 
+	// get datastore info, gc and job metrics
+	// errors are only logged, so a token without access to these endpoints doesn't fail the whole scrape
+	collectors := []struct {
+		name       string
+		path       string
+		permission string
+		collect    func(chan<- prometheus.Metric) error
+	}{
+		{"datastore info", datastoreApi, "Datastore.Audit on /datastore", e.getDatastoreInfoMetrics},
+		{"garbage collection", gcApi, "Datastore.Audit on /datastore", e.getGCMetrics},
+		{"sync job", syncApi, "Datastore.Audit on /datastore and Remote.Audit on /remote", e.getSyncJobMetrics},
+		{"prune job", pruneApi, "Datastore.Audit on /datastore", e.getPruneJobMetrics},
+		{"verify job", verifyApi, "Datastore.Audit on /datastore", e.getVerifyJobMetrics},
+		{"running task", nodeApi + "/localhost/tasks", "Sys.Audit on /system/tasks", e.getRunningTaskMetrics},
+	}
+	for _, c := range collectors {
+		err := c.collect(ch)
+		if errors.Is(err, errForbidden) {
+			logMissingPermission(e.endpoint, c.path, c.permission, c.name+" metrics")
+		} else if err != nil {
+			log.Printf("WARN: Unable to collect %s metrics: %s", c.name, strings.ReplaceAll(strings.ReplaceAll(err.Error(), "\n", ""), "\r", ""))
+		}
+	}
+
 	return nil
+}
+
+// errForbidden is returned when the API token lacks the permissions for a request.
+var errForbidden = errors.New("permission denied")
+
+// loggedMissingPermissions remembers which missing permissions were already logged, so they are logged once per target and api path.
+var loggedMissingPermissions sync.Map
+
+// logMissingPermission logs that metrics are skipped because of a missing permission.
+// It's logged once per target and api path, repeated occurrences only with debug loglevel.
+func logMissingPermission(endpoint string, path string, permission string, skipped string) {
+	msg := fmt.Sprintf("Missing permission %s for %s on endpoint %s, skipping %s", permission, path, endpoint, skipped)
+	msg = strings.ReplaceAll(strings.ReplaceAll(msg, "\n", ""), "\r", "")
+	if _, logged := loggedMissingPermissions.LoadOrStore(endpoint+path, true); logged {
+		if *loglevel == "debug" {
+			log.Printf("DEBUG: %s", msg)
+		}
+		return
+	}
+	log.Printf("WARN: %s", msg)
+}
+
+// getJSON requests the given api path and unmarshals the json response into out.
+func (e *Exporter) getJSON(path string, out any) error {
+	req, err := http.NewRequest("GET", e.endpoint+path, nil)
+	if err != nil {
+		return err
+	}
+
+	// add Authorization header
+	req.Header.Set("Authorization", e.authorizationHeader)
+
+	// debug
+	if *loglevel == "debug" {
+		log.Printf("DEBUG: Request URL: %s", req.URL)
+	}
+
+	// make request and show output
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err := resp.Body.Close(); err != nil {
+		log.Printf("Error closing response body: %v", err)
+	}
+	if err != nil {
+		return err
+	}
+
+	// check if status code is 200
+	if resp.StatusCode == http.StatusForbidden {
+		return errForbidden
+	}
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("ERROR: Status code %d returned from endpoint: %s", resp.StatusCode, e.endpoint)
+	}
+
+	// debug
+	if *loglevel == "debug" {
+		log.Printf("DEBUG: Status code %d returned from endpoint: %s", resp.StatusCode, e.endpoint)
+	}
+
+	// parse json
+	return json.Unmarshal(body, out)
+}
+
+func (e *Exporter) getDatastoreInfoMetrics(ch chan<- prometheus.Metric) error {
+	var response DatastoreListResponse
+	if err := e.getJSON(datastoreApi, &response); err != nil {
+		return err
+	}
+
+	for _, datastore := range response.Data {
+		ch <- prometheus.MustNewConstMetric(
+			datastore_info, prometheus.GaugeValue, 1,
+			datastore.Store, datastore.BackendType, datastore.MountStatus, parseMaintenanceType(datastore.Maintenance),
+		)
+	}
+
+	return nil
+}
+
+func (e *Exporter) getGCMetrics(ch chan<- prometheus.Metric) error {
+	var response GCJobResponse
+	if err := e.getJSON(gcApi, &response); err != nil {
+		return err
+	}
+
+	for _, gc := range response.Data {
+		// same logic as the PBS web UI: while a gc is running, last-run-endtime is missing,
+		// while upid and statistics still belong to the last finished gc
+		running := 0.0
+		if gc.Upid != "" && gc.LastRunEndtime == nil {
+			running = 1.0
+		}
+		ch <- prometheus.MustNewConstMetric(
+			gc_running, prometheus.GaugeValue, running, gc.Store,
+		)
+		if gc.NextRun != nil {
+			ch <- prometheus.MustNewConstMetric(
+				gc_next_run_timestamp_seconds, prometheus.GaugeValue, float64(*gc.NextRun), gc.Store,
+			)
+		}
+
+		// the remaining metrics are only available if gc has finished at least once
+		if gc.Upid == "" {
+			continue
+		}
+		if startTime, ok := parseUpidStartTime(gc.Upid); ok {
+			ch <- prometheus.MustNewConstMetric(
+				gc_last_run_start_timestamp_seconds, prometheus.GaugeValue, float64(startTime), gc.Store,
+			)
+		}
+		if gc.LastRunState != "" {
+			emitJobStatus(ch, gc_last_run_status, gc.LastRunState, gc.Store)
+		}
+		if gc.LastRunEndtime != nil {
+			ch <- prometheus.MustNewConstMetric(
+				gc_last_run_end_timestamp_seconds, prometheus.GaugeValue, float64(*gc.LastRunEndtime), gc.Store,
+			)
+		}
+		if gc.Duration != nil {
+			ch <- prometheus.MustNewConstMetric(
+				gc_last_run_duration_seconds, prometheus.GaugeValue, float64(*gc.Duration), gc.Store,
+			)
+		}
+		ch <- prometheus.MustNewConstMetric(
+			gc_removed_bytes, prometheus.GaugeValue, float64(gc.RemovedBytes), gc.Store,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			gc_removed_chunks, prometheus.GaugeValue, float64(gc.RemovedChunks), gc.Store,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			gc_pending_bytes, prometheus.GaugeValue, float64(gc.PendingBytes), gc.Store,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			gc_pending_chunks, prometheus.GaugeValue, float64(gc.PendingChunks), gc.Store,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			gc_removed_bad_chunks, prometheus.GaugeValue, float64(gc.RemovedBad), gc.Store,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			gc_still_bad_chunks, prometheus.GaugeValue, float64(gc.StillBad), gc.Store,
+		)
+	}
+
+	return nil
+}
+
+func (e *Exporter) getSyncJobMetrics(ch chan<- prometheus.Metric) error {
+	var response SyncJobResponse
+	if err := e.getJSON(syncApi, &response); err != nil {
+		return err
+	}
+
+	for _, job := range response.Data {
+		direction := job.SyncDirection
+		if direction == "" {
+			direction = "pull"
+		}
+		ch <- prometheus.MustNewConstMetric(
+			sync_job_descs.info, prometheus.GaugeValue, 1, job.Store, job.ID, job.Remote, job.RemoteStore, direction,
+		)
+		emitJobMetrics(ch, sync_job_descs, job.JobStatus, job.Store, job.ID)
+	}
+
+	return nil
+}
+
+func (e *Exporter) getPruneJobMetrics(ch chan<- prometheus.Metric) error {
+	var response PruneJobResponse
+	if err := e.getJSON(pruneApi, &response); err != nil {
+		return err
+	}
+
+	for _, job := range response.Data {
+		ch <- prometheus.MustNewConstMetric(
+			prune_job_descs.info, prometheus.GaugeValue, 1, job.Store, job.ID, job.Namespace,
+		)
+		emitJobMetrics(ch, prune_job_descs, job.JobStatus, job.Store, job.ID)
+	}
+
+	return nil
+}
+
+func (e *Exporter) getVerifyJobMetrics(ch chan<- prometheus.Metric) error {
+	var response VerifyJobResponse
+	if err := e.getJSON(verifyApi, &response); err != nil {
+		return err
+	}
+
+	for _, job := range response.Data {
+		ch <- prometheus.MustNewConstMetric(
+			verify_job_descs.info, prometheus.GaugeValue, 1, job.Store, job.ID,
+		)
+		emitJobMetrics(ch, verify_job_descs, job.JobStatus, job.Store, job.ID)
+	}
+
+	return nil
+}
+
+func (e *Exporter) getRunningTaskMetrics(ch chan<- prometheus.Metric) error {
+	// NOTE: without Sys.Audit on /system/tasks, PBS only lists the tasks of the token's own user
+	var response TaskResponse
+	if err := e.getJSON(nodeApi+"/localhost/tasks?running=1&limit=0", &response); err != nil {
+		return err
+	}
+
+	// several tasks can share type and id, keep the earliest start time to catch the longest running one
+	startTimes := make(map[[2]string]int64)
+	for _, task := range response.Data {
+		key := [2]string{task.WorkerType, task.WorkerID}
+		if startTime, ok := startTimes[key]; !ok || task.StartTime < startTime {
+			startTimes[key] = task.StartTime
+		}
+	}
+	for key, startTime := range startTimes {
+		ch <- prometheus.MustNewConstMetric(
+			task_running_start_timestamp_seconds, prometheus.GaugeValue, float64(startTime), key[0], key[1],
+		)
+	}
+
+	return nil
+}
+
+// emitJobMetrics sets the run state metrics of a sync, prune or verify job.
+func emitJobMetrics(ch chan<- prometheus.Metric, descs jobDescs, js JobStatus, labels ...string) {
+	running := 0.0
+	if js.LastRunUpid != "" && js.LastRunEndtime == nil {
+		running = 1.0
+	}
+	ch <- prometheus.MustNewConstMetric(
+		descs.running, prometheus.GaugeValue, running, labels...,
+	)
+	if js.NextRun != nil {
+		ch <- prometheus.MustNewConstMetric(
+			descs.nextRunTime, prometheus.GaugeValue, float64(*js.NextRun), labels...,
+		)
+	}
+
+	startTime, hasStartTime := parseUpidStartTime(js.LastRunUpid)
+	if hasStartTime {
+		ch <- prometheus.MustNewConstMetric(
+			descs.lastRunStartTime, prometheus.GaugeValue, float64(startTime), labels...,
+		)
+	}
+
+	// the remaining metrics are only available if the job has finished at least once
+	if js.LastRunState == "" {
+		return
+	}
+	emitJobStatus(ch, descs.lastRunStatus, js.LastRunState, labels...)
+	if js.LastRunEndtime != nil {
+		ch <- prometheus.MustNewConstMetric(
+			descs.lastRunEndTime, prometheus.GaugeValue, float64(*js.LastRunEndtime), labels...,
+		)
+		if hasStartTime {
+			ch <- prometheus.MustNewConstMetric(
+				descs.lastRunDuration, prometheus.GaugeValue, float64(*js.LastRunEndtime-startTime), labels...,
+			)
+		}
+	}
+}
+
+// emitJobStatus emits a metric for each possible job status with 1/0
+func emitJobStatus(ch chan<- prometheus.Metric, desc *prometheus.Desc, state string, labels ...string) {
+	category := jobStatusCategory(state)
+	for _, s := range jobStatuses {
+		val := 0.0
+		if category == s {
+			val = 1.0
+		}
+		ch <- prometheus.MustNewConstMetric(
+			desc, prometheus.GaugeValue, val, append(append([]string{}, labels...), s)...,
+		)
+	}
+}
+
+// jobStatusCategory maps the PBS task state ("OK", "WARNINGS: <n>" or an error message) to ok, warning or error.
+func jobStatusCategory(state string) string {
+	switch {
+	case state == "OK":
+		return "ok"
+	case strings.HasPrefix(state, "WARNINGS"):
+		return "warning"
+	default:
+		return "error"
+	}
+}
+
+// parseUpidStartTime returns the start time encoded in a PBS UPID
+// (UPID:node:pid:pstart:task_id:starttime:wtype:wid:authid:, starttime in hex).
+func parseUpidStartTime(upid string) (int64, bool) {
+	parts := strings.Split(upid, ":")
+	if len(parts) < 9 || parts[0] != "UPID" {
+		return 0, false
+	}
+	startTime, err := strconv.ParseInt(parts[5], 16, 64)
+	if err != nil {
+		return 0, false
+	}
+	return startTime, true
+}
+
+// parseMaintenanceType returns the type of a maintenance mode string like "type=offline,message=...".
+func parseMaintenanceType(maintenance string) string {
+	for _, part := range strings.Split(maintenance, ",") {
+		key, value, found := strings.Cut(part, "=")
+		if !found {
+			// the type is the default key, so "offline" equals "type=offline"
+			key, value = "type", key
+		}
+		if key == "type" && value != "" {
+			return value
+		}
+	}
+	return "none"
 }
 
 func (e *Exporter) getVersion(ch chan<- prometheus.Metric) error {
@@ -591,6 +1206,12 @@ func (e *Exporter) getNodeMetrics(ch chan<- prometheus.Metric) error {
 		return err
 	}
 
+	// skip host metrics if the token lacks Sys.Audit, instead of failing the whole scrape
+	if resp.StatusCode == http.StatusForbidden {
+		logMissingPermission(e.endpoint, nodeApi+"/localhost/status", "Sys.Audit on /system/status", "host metrics")
+		return nil
+	}
+
 	// check if status code is 200
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("ERROR: Status code %d returned from endpoint: %s", resp.StatusCode, e.endpoint)
@@ -678,6 +1299,25 @@ func (e *Exporter) getDatastoreMetric(datastore Datastore, ch chan<- prometheus.
 	ch <- prometheus.MustNewConstMetric(
 		used, prometheus.GaugeValue, float64(datastore.Used), datastore.Store,
 	)
+	if datastore.EstimatedFullDate > 0 {
+		ch <- prometheus.MustNewConstMetric(
+			datastore_estimated_full_timestamp_seconds, prometheus.GaugeValue, float64(datastore.EstimatedFullDate), datastore.Store,
+		)
+	}
+	if datastore.GCStatus != nil {
+		ch <- prometheus.MustNewConstMetric(
+			datastore_index_data_bytes, prometheus.GaugeValue, float64(datastore.GCStatus.IndexDataBytes), datastore.Store,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			datastore_disk_bytes, prometheus.GaugeValue, float64(datastore.GCStatus.DiskBytes), datastore.Store,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			datastore_disk_chunks, prometheus.GaugeValue, float64(datastore.GCStatus.DiskChunks), datastore.Store,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			datastore_index_file_count, prometheus.GaugeValue, float64(datastore.GCStatus.IndexFileCount), datastore.Store,
+		)
+	}
 
 	// get namespaces of datastore
 	req, err := http.NewRequest("GET", e.endpoint+datastoreApi+"/"+datastore.Store+"/namespace", nil)
@@ -710,6 +1350,10 @@ func (e *Exporter) getDatastoreMetric(datastore Datastore, ch chan<- prometheus.
 
 	// check if status code is 200
 	if resp.StatusCode != 200 {
+		if resp.StatusCode == http.StatusForbidden {
+			logMissingPermission(e.endpoint, datastoreApi+"/"+datastore.Store+"/namespace", "Datastore.Audit on /datastore/"+datastore.Store, "snapshot metrics of datastore "+datastore.Store)
+			return nil
+		}
 		if resp.StatusCode == 400 {
 			// check if datastore is being deleted
 			isBeingDeleted, err := regexp.MatchString("(?i)datastore is being deleted", string(body[:]))
@@ -797,6 +1441,12 @@ func (e *Exporter) getNamespaceMetric(datastore string, namespace string, ch cha
 	}
 	if err != nil {
 		return err
+	}
+
+	// skip namespaces the token lacks permissions for
+	if resp.StatusCode == http.StatusForbidden {
+		logMissingPermission(e.endpoint, datastoreApi+"/"+datastore+"/snapshots?ns="+namespace, "Datastore.Audit on /datastore/"+datastore, "snapshot metrics of namespace "+namespace)
+		return nil
 	}
 
 	// check if status code is 200
